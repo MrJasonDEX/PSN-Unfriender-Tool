@@ -23,6 +23,8 @@ Easily mass-unfriend, whitelist, tag, backup, and audit your friends — all wit
 - [Configuration](#configuration)
 - [FAQ](#faq)
 - [License](#license)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
 
 ---
 
@@ -253,6 +255,30 @@ A: Yes! As long as Python 3.8+ is installed, it works cross-platform.
 ## License
 
 This project is licensed under the MIT License — see the LICENSE file for details.
+
+---
+
+## Roadmap
+
+- [ ] Undo/redo actions in GUI
+- [ ] Scheduled backups and cleanups
+- [ ] Update notifications
+- [ ] Plugin and API integrations
+- [ ] Customizable GUI themes and filters
+- [ ] Cloud backup support
+- [ ] More export/import formats
+
+---
+
+## Contributing
+
+Contributions, issues, and feature requests are welcome!
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature-name`)
+3. Commit your changes (`git commit -m 'Add feature'`)
+4. Push to your branch (`git push origin feature-name`)
+5. Open a Pull Request
 
 ---
 

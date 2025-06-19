@@ -106,7 +106,11 @@ class PSNUnfrienderGUI:
         helpmenu = tk.Menu(menubar, tearoff=0)
         helpmenu.add_command(label="About", command=self.show_about)
         helpmenu.add_command(label="Help", command=self.show_help)
+        # New: Settings menu
+        settingsmenu = tk.Menu(menubar, tearoff=0)
+        settingsmenu.add_command(label="Open Log File", command=self.open_log_file)
         menubar.add_cascade(label="Help", menu=helpmenu)
+        menubar.add_cascade(label="Settings", menu=settingsmenu)
         root.config(menu=menubar)
 
         self.apply_theme()
@@ -408,6 +412,13 @@ class PSNUnfrienderGUI:
             "8. Undo last unfriend if needed.\n"
             "9. See the log file for a history of your actions."
         )
+
+    def open_log_file(self):
+        import webbrowser
+        if os.path.exists(LOG_FILE):
+            webbrowser.open(LOG_FILE)
+        else:
+            messagebox.showinfo("Log", "Log file not found.")
 
 if __name__ == "__main__":
     root = tk.Tk()
