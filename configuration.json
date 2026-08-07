@@ -1,7 +1,6 @@
 {
-  "npsso_token": "PASTE TOKEN",
-   "nameWhitelistPatterns": [
-    "Bob",
-   
+  "npsso_token": "YOUR TOKEN",
+  "nameWhitelistPatterns": [
+    " "
   ]
 }

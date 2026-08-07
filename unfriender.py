@@ -1,10 +1,123 @@
 import json
+import random
 import re
+import time
+from collections import namedtuple
 from urllib.parse import parse_qs
 from urllib.parse import urlparse
 
 import requests
 from tqdm import tqdm
+
+# --- networking ------------------------------------------------------------
+#
+# Every call below goes through _request(). Three things were going wrong on
+# large batches (the report that prompted this: a 73-friend removal died
+# partway through):
+#
+#   1. No request ever set a timeout, so a connection that stalled would hang
+#      the worker thread forever with no way out.
+#   2. PSN rate-limits a burst of back-to-back DELETEs. raise_for_status() turned
+#      the first 429 into an exception that aborted the whole remaining batch.
+#   3. A single transient failure anywhere in the loop discarded the progress
+#      already made, and the caller had no idea who had actually been removed.
+#
+# So: bounded timeouts, retry with backoff on the statuses that are worth
+# retrying, and a removal loop that isolates per-friend failures instead of
+# letting one kill the run.
+
+# (connect, read). The read budget is generous because PSN can be slow under
+# load, but it is finite - that is the entire point.
+DEFAULT_TIMEOUT = (10, 30)
+
+# 429 is rate limiting; the 5xx family is PSN having a bad moment. Both are
+# worth retrying. Everything else (401 expired token, 403, 404) is a real
+# answer and retrying it just wastes the user's time.
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+MAX_ATTEMPTS = 4
+BACKOFF_BASE = 1.5
+
+# Small gap between consecutive removals. Staying under the rate limit is much
+# cheaper than being throttled and backing off once we hit it.
+REMOVE_DELAY = 0.35
+
+# stopped distinguishes "the user cancelled" from "finished with errors" - the
+# two need very different wording in the UI.
+RemovalResult = namedtuple("RemovalResult", "removed failures stopped")
+
+# One session for the whole run: without it each of 73 removals pays for a
+# fresh TCP + TLS handshake.
+_session = requests.Session()
+
+
+class Stopped(Exception):
+    """Raised when the caller cancelled the operation mid-flight.
+
+    Deliberately distinct from a request failure: a removal the user cancelled
+    is not an error and must never be reported as one.
+    """
+
+
+def _wait(seconds, stop_event=None):
+    """Sleep, waking early if stop_event is set. True means it was cut short.
+
+    Every wait in this module goes through here. A plain time.sleep() would make
+    Stop appear frozen for the length of a rate-limit backoff - up to 30s - which
+    is exactly when a user is most likely to want out.
+    """
+    if stop_event is None:
+        time.sleep(seconds)
+        return False
+    return stop_event.wait(seconds)
+
+
+def _sleep_for(attempt, response=None):
+    """Seconds to wait before the next attempt.
+
+    Honours Retry-After when PSN sends one, since the server's own number beats
+    anything guessed here. Otherwise exponential backoff with jitter, so a
+    retried batch does not resynchronise into another burst.
+    """
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(float(retry_after), 60.0)
+            except ValueError:
+                pass
+    return min(BACKOFF_BASE ** attempt + random.uniform(0, 0.4), 30.0)
+
+
+def _request(method, url, stop_event=None, **kwargs):
+    """Perform a request with a timeout and bounded retries.
+
+    Raises the last error if every attempt fails, so callers keep the same
+    failure semantics they had with raise_for_status(). Raises Stopped if
+    stop_event is set while waiting to retry.
+    """
+    kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
+    last_error = None
+
+    for attempt in range(MAX_ATTEMPTS):
+        response = None
+        try:
+            response = _session.request(method, url, **kwargs)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_error = e
+        else:
+            if response.status_code not in RETRYABLE_STATUS:
+                response.raise_for_status()
+                return response
+            last_error = requests.HTTPError(
+                f"{response.status_code} from {url}", response=response)
+
+        if attempt == MAX_ATTEMPTS - 1:
+            break
+        if _wait(_sleep_for(attempt, response), stop_event):
+            raise Stopped("cancelled while waiting to retry")
+
+    raise last_error
 
 
 def obtain_auth_code(npsso_token):
@@ -19,13 +132,13 @@ def obtain_auth_code(npsso_token):
         "redirect_uri": "com.scee.psxandroid.scecompcall://redirect",
         "response_type": "code",
     }
-    response = requests.get(
+    response = _request(
+        "GET",
         url,
         headers=headers,
         params=params,
         allow_redirects=False,
     )
-    response.raise_for_status()
 
     location_url = response.headers["location"]
     parsed_url = urlparse(location_url)
@@ -47,12 +160,12 @@ def obtain_auth_jwt(code):
     headers = {
         "Authorization": "Basic MDk1MTUxNTktNzIzNy00MzcwLTliNDAtMzgwNmU2N2MwODkxOnVjUGprYTV0bnRCMktxc1A="
     }
-    response = requests.post(
+    response = _request(
+        "POST",
         url,
         headers=headers,
         data=body
     )
-    response.raise_for_status()
 
     auth_resp_json = response.json()
     return auth_resp_json["access_token"]
@@ -76,8 +189,7 @@ def get_friend_list(jwt_token):
         "Authorization": f"Bearer {jwt_token}"
     }
 
-    response = requests.get(url, params=params, headers=headers)
-    response.raise_for_status()
+    response = _request("GET", url, params=params, headers=headers)
 
     response_json = response.json()
     return response_json['friends']
@@ -94,8 +206,7 @@ def profile_ids_to_names_chunked(jwt_token, profile_ids, start=0):
         "user-agent": "okhttp/4.9.2",
         "Authorization": f"Bearer {jwt_token}"
     }
-    response = requests.get(url, params=params, headers=headers)
-    response.raise_for_status()
+    response = _request("GET", url, params=params, headers=headers)
 
     response_json = response.json()
     return response_json['profiles']
@@ -115,7 +226,7 @@ def profile_ids_to_names(jwt_token, profile_ids):
     return to_return
 
 
-def remove_friend(jwt_token, profile_id):
+def remove_friend(jwt_token, profile_id, stop_event=None):
     url = f"https://m.np.playstation.com/api/userProfile/v1/internal/users/me/friends/{profile_id}"
     headers = {
         "Content-Type": "application/json",
@@ -123,8 +234,7 @@ def remove_friend(jwt_token, profile_id):
         "user-agent": "okhttp/4.9.2",
         "Authorization": f"Bearer {jwt_token}"
     }
-    response = requests.delete(url, headers=headers)
-    response.raise_for_status()
+    _request("DELETE", url, headers=headers, stop_event=stop_event)
 
 
 def is_name_whitelisted(patterns, name):
@@ -151,12 +261,56 @@ def get_friends_with_names(auth, whitelist_patterns):
     return to_keep, to_remove
 
 
-def remove_friends(auth, friends, progress_callback=None):
+def remove_friends(auth, friends, progress_callback=None, delay=REMOVE_DELAY,
+                   stop_event=None):
+    """Remove each friend in turn, isolating per-friend failures.
+
+    Returns a RemovalResult: .removed is the friend tuples PSN actually
+    accepted, .failures is a list of (friend, error_message), and .stopped says
+    whether the run ended early because the caller cancelled it.
+
+    A failure no longer aborts the batch. Previously one 429 partway through a
+    long run raised out of the loop, so the friends already removed were left
+    unreported and the rest were silently skipped - which is what a caller saw
+    as the whole operation "timing out".
+
+    stop_event is an optional threading.Event. It is checked between removals
+    and interrupts the throttle and retry waits, so cancelling takes effect
+    immediately rather than after a backoff finishes. Whatever was removed
+    before the stop is still returned - the removals are already permanent, so
+    the caller must be told about them.
+    """
+    removed = []
+    failures = []
+    stopped = False
+    total = len(friends)
+
     for idx, friend in enumerate(friends):
-        friend_id = friend[0]
-        remove_friend(auth, friend_id)
+        if stop_event is not None and stop_event.is_set():
+            stopped = True
+            break
+
+        try:
+            remove_friend(auth, friend[0], stop_event=stop_event)
+            removed.append(friend)
+        except Stopped:
+            # Cancelled, not failed. Must be caught ahead of the generic
+            # handler below or the friend lands in the failure report.
+            stopped = True
+            break
+        except Exception as e:
+            failures.append((friend, str(e)))
+
         if progress_callback:
-            progress_callback(idx + 1, len(friends))
+            progress_callback(idx + 1, total)
+
+        # Throttle between requests, not after the last one.
+        if delay and idx + 1 < total:
+            if _wait(delay, stop_event):
+                stopped = True
+                break
+
+    return RemovalResult(removed, failures, stopped)
 
 
 if __name__ == '__main__':
@@ -200,6 +354,16 @@ if __name__ == '__main__':
         exit(1)
 
     print(f"\nRemoving {len(to_remove)} friends...")
-    for friend in tqdm(to_remove):
-        friend_id = friend[0]
-        remove_friend(auth, friend_id)
+    with tqdm(total=len(to_remove)) as bar:
+        result = remove_friends(
+            auth, to_remove, progress_callback=lambda done, total: bar.update(1))
+
+    if result.stopped:
+        print(f"\nStopped. Removed {len(result.removed)} of {len(to_remove)} "
+              "friends before cancelling.")
+    else:
+        print(f"\nRemoved {len(result.removed)} of {len(to_remove)} friends.")
+    if result.failures:
+        print(f"\n{len(result.failures)} could not be removed:")
+        for friend, error in result.failures:
+            print(f"  {friend[1]} ({friend[0]}): {error}")

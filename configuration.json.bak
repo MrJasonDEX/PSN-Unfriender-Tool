@@ -1,0 +1,7 @@
+{
+  "npsso_token": "YOUR KEY",
+   "nameWhitelistPatterns": [
+    "Bob",
+   
+  ]
+}
